@@ -51,9 +51,8 @@ BENCHMARK_DEFINE_F(LoggingBenchmark, SimulatedTPCCTransaction)(benchmark::State&
     std::vector<std::byte> before_img(update_length, std::byte{0});
     std::vector<std::byte> after_img(update_length, std::byte{1});
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dist(5, 15); // Random number of updates per txn
+    std::mt19937 gen(42); // fixed seed
+    std::uniform_int_distribution<> dist(10, 30); // Random number of updates per txn
 
     for (auto _ : state) {
         uint64_t current_txn = txn_id++;
@@ -83,6 +82,10 @@ BENCHMARK_DEFINE_F(LoggingBenchmark, SimulatedTPCCTransaction)(benchmark::State&
 
 BENCHMARK_REGISTER_F(LoggingBenchmark, SimulatedTPCCTransaction)
     ->ThreadRange(1, 16)
+    ->Unit(benchmark::kMicrosecond)
+    ->MinTime(5.0)
+    ->Repetitions(3)
+    ->ReportAggregatesOnly(true) 
     ->UseRealTime();
 
 } // namespace buzzdb
