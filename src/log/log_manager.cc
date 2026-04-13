@@ -43,6 +43,27 @@ LogManager::LogManager(File* log_file) {
 
 LogManager::~LogManager() {}
 
+LogManager::LogManager(const LogManager& other) {
+    log_file_ = other.log_file_;
+    current_offset_ = other.current_offset_;
+    txn_id_to_first_log_record = other.txn_id_to_first_log_record;
+    log_record_type_to_count = other.log_record_type_to_count;
+    active_txns = other.active_txns;
+    // do not copy log_mutex_
+}
+
+LogManager& LogManager::operator=(const LogManager& other) {
+    if (this != &other) {
+        log_file_ = other.log_file_;
+        current_offset_ = other.current_offset_;
+        txn_id_to_first_log_record = other.txn_id_to_first_log_record;
+        log_record_type_to_count = other.log_record_type_to_count;
+        active_txns = other.active_txns;
+        // do not copy log_mutex_
+    }
+    return *this;
+}
+
 void LogManager::reset(File* log_file) {
     log_file_ = log_file;
     current_offset_ = 0;
@@ -72,6 +93,7 @@ uint64_t LogManager::get_total_log_records_of_type(UNUSED_ATTRIBUTE LogRecordTyp
  */
 void LogManager::log_abort(UNUSED_ATTRIBUTE uint64_t txn_id,
                            UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::ABORT_RECORD]++;
     rollback_txn(txn_id, buffer_manager);
     active_txns.erase(txn_id);
@@ -85,6 +107,7 @@ void LogManager::log_abort(UNUSED_ATTRIBUTE uint64_t txn_id,
  * Remove from the active transactions
  */
 void LogManager::log_commit(UNUSED_ATTRIBUTE uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::COMMIT_RECORD]++;
     active_txns.erase(txn_id);
     write_val(LogRecordType::COMMIT_RECORD);
@@ -105,6 +128,7 @@ void LogManager::log_update(UNUSED_ATTRIBUTE uint64_t txn_id, UNUSED_ATTRIBUTE u
                             UNUSED_ATTRIBUTE uint64_t length, UNUSED_ATTRIBUTE uint64_t offset,
                             UNUSED_ATTRIBUTE std::byte* before_img,
                             UNUSED_ATTRIBUTE std::byte* after_img) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::UPDATE_RECORD]++;
 
     write_val(LogRecordType::UPDATE_RECORD);
@@ -126,6 +150,7 @@ void LogManager::log_update(UNUSED_ATTRIBUTE uint64_t txn_id, UNUSED_ATTRIBUTE u
  * Add to the active transactions
  */
 void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::BEGIN_RECORD]++;
     active_txns.insert(txn_id);
     if (txn_id_to_first_log_record.find(txn_id) == txn_id_to_first_log_record.end()) {
@@ -141,6 +166,7 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
  * Add the checkpoint log record to the log file
  */
 void LogManager::log_checkpoint(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD]++;
     buffer_manager.flush_all_pages();
 

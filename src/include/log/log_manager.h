@@ -3,6 +3,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 
 #include "buffer/buffer_manager.h"
@@ -26,6 +27,12 @@ class LogManager {
 
     /// Destructor.
     ~LogManager();
+
+    /// Copy Constructor
+    LogManager(const LogManager& other);
+
+    /// Copy Assignment Operator
+    LogManager& operator=(const LogManager& other);
 
     /// Add an abort record
     void log_abort(uint64_t txn_id, BufferManager& buffer_manager);
@@ -60,6 +67,7 @@ class LogManager {
 
    private:
     File* log_file_;
+    std::mutex log_mutex_;
 
     // offset in the file
     size_t current_offset_ = 0;
