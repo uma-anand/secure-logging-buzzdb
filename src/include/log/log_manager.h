@@ -5,6 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <array>
+#include <vector>
 
 #include "buffer/buffer_manager.h"
 #include "storage/test_file.h"
@@ -68,6 +70,9 @@ class LogManager {
    private:
     File* log_file_;
     std::mutex log_mutex_;
+
+    // The running master hash (H_{i-1})
+    std::array<unsigned char, 16> prev_mac_ = {0};
 
     // offset in the file
     size_t current_offset_ = 0;

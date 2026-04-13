@@ -6,11 +6,46 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <openssl/evp.h>
 
 #include "common/macros.h"
 #include "storage/test_file.h"
 
 namespace buzzdb {
+
+// Temporary hardcoded key and IV for prototype
+const unsigned char AES_KEY[32] = {0}; // 256-bit key
+const unsigned char AES_IV[12] = {0};  // 96-bit IV
+
+// Computes H_i = MAC(Data_i || H_{i-1} || LSN_i)
+std::array<unsigned char, 16> compute_gmac(
+    const std::vector<char>& data, 
+    const std::array<unsigned char, 16>& prev_mac, 
+    uint64_t lsn) 
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    std::array<unsigned char, 16> out_mac = {0};
+    
+    // AES-256-GCM
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+    EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, AES_IV);
+    
+    int len;
+    // 1. Data_i (The serialized log record)
+    if (!data.empty()) {
+        EVP_EncryptUpdate(ctx, NULL, &len, reinterpret_cast<const unsigned char*>(data.data()), data.size());
+    }
+    // 2. H_{i-1} (The previous MAC)
+    EVP_EncryptUpdate(ctx, NULL, &len, prev_mac.data(), prev_mac.size());
+    // 3. LSN_i (The file offset)
+    EVP_EncryptUpdate(ctx, NULL, &len, reinterpret_cast<const unsigned char*>(&lsn), sizeof(uint64_t));
+    
+    EVP_EncryptFinal_ex(ctx, NULL, &len);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, out_mac.data());
+    
+    EVP_CIPHER_CTX_free(ctx);
+    return out_mac;
+}
 
 /**
  * Functionality of the buffer manager that might be handy
@@ -91,14 +126,28 @@ uint64_t LogManager::get_total_log_records_of_type(UNUSED_ATTRIBUTE LogRecordTyp
  * Add abort log record to the log file.
  * Remove from the active transactions.
  */
-void LogManager::log_abort(UNUSED_ATTRIBUTE uint64_t txn_id,
-                           UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::ABORT_RECORD]++;
     rollback_txn(txn_id, buffer_manager);
     active_txns.erase(txn_id);
-    write_val(LogRecordType::ABORT_RECORD);
-    write_val(txn_id);
+
+    std::vector<char> record_buffer;
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::ABORT_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
+    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+
+    prev_mac_ = mac;
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
 }
 
 /**
@@ -106,12 +155,27 @@ void LogManager::log_abort(UNUSED_ATTRIBUTE uint64_t txn_id,
  * Add commit log record to the log file
  * Remove from the active transactions
  */
-void LogManager::log_commit(UNUSED_ATTRIBUTE uint64_t txn_id) {
+void LogManager::log_commit(uint64_t txn_id) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::COMMIT_RECORD]++;
     active_txns.erase(txn_id);
-    write_val(LogRecordType::COMMIT_RECORD);
-    write_val(txn_id);
+
+    std::vector<char> record_buffer;
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::COMMIT_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
+    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+
+    prev_mac_ = mac;
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
 }
 
 /**
@@ -124,24 +188,42 @@ void LogManager::log_commit(UNUSED_ATTRIBUTE uint64_t txn_id) {
  * @param before_img	before image of the buffer page at the given offset
  * @param after_img		after image of the buffer page at the given offset
  */
-void LogManager::log_update(UNUSED_ATTRIBUTE uint64_t txn_id, UNUSED_ATTRIBUTE uint64_t page_id,
-                            UNUSED_ATTRIBUTE uint64_t length, UNUSED_ATTRIBUTE uint64_t offset,
-                            UNUSED_ATTRIBUTE std::byte* before_img,
-                            UNUSED_ATTRIBUTE std::byte* after_img) {
+void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
+                            uint64_t length, uint64_t offset,
+                            std::byte* before_img,
+                            std::byte* after_img) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::UPDATE_RECORD]++;
 
-    write_val(LogRecordType::UPDATE_RECORD);
-    write_val(txn_id);
-    write_val(page_id);
-    write_val(length);
-    write_val(offset);
+    std::vector<char> record_buffer;
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
 
-    log_file_->write_block(reinterpret_cast<char*>(before_img), current_offset_, length);
-    current_offset_ += length;
+    // 1. Serialize everything into the buffer
+    LogRecordType type = LogRecordType::UPDATE_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+    append_to_buf(page_id);
+    append_to_buf(length);
+    append_to_buf(offset);
 
-    log_file_->write_block(reinterpret_cast<char*>(after_img), current_offset_, length);
-    current_offset_ += length;
+    // Append images to buffer so they are hashed
+    const char* before_ptr = reinterpret_cast<const char*>(before_img);
+    record_buffer.insert(record_buffer.end(), before_ptr, before_ptr + length);
+
+    const char* after_ptr = reinterpret_cast<const char*>(after_img);
+    record_buffer.insert(record_buffer.end(), after_ptr, after_ptr + length);
+
+    // 2. Compute and Append MAC
+    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
+    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+
+    // 3. Persistent Write
+    prev_mac_ = mac;
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
 }
 
 /**
@@ -156,8 +238,34 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
     if (txn_id_to_first_log_record.find(txn_id) == txn_id_to_first_log_record.end()) {
         txn_id_to_first_log_record[txn_id] = current_offset_;
     }
-    write_val(LogRecordType::BEGIN_RECORD);
-    write_val(txn_id);
+    
+    // Buffer the record data
+    std::vector<char> record_buffer;
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::BEGIN_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    // Compute the MAC over the buffer, previous MAC, and current LSN
+    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
+
+    // std::cout << "Txn " << txn_id << " at LSN " << current_offset_ << " | MAC: ";
+    // for (int i = 0; i < 16; ++i) {
+    //     printf("%02x", mac[i]);
+    // }
+    // std::cout << std::endl;
+    
+    // Append the MAC to the buffer
+    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+
+    // Write the entire authenticated record to disk
+    prev_mac_ = mac;
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
 }
 
 /**
@@ -165,20 +273,35 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
  * Flush all dirty pages to the disk (USE: buffer_manager.flush_all_pages())
  * Add the checkpoint log record to the log file
  */
-void LogManager::log_checkpoint(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+void LogManager::log_checkpoint(BufferManager& buffer_manager) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD]++;
     buffer_manager.flush_all_pages();
 
-    write_val(LogRecordType::CHECKPOINT_RECORD);
+    std::vector<char> record_buffer;
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::CHECKPOINT_RECORD;
+    append_to_buf(type);
     
     uint64_t active_count = active_txns.size();
-    write_val(active_count);
+    append_to_buf(active_count);
 
     for (uint64_t txn_id : active_txns) {
-        write_val(txn_id);
-        write_val(txn_id_to_first_log_record[txn_id]);
+        append_to_buf(txn_id);
+        append_to_buf(txn_id_to_first_log_record[txn_id]);
     }
+
+    // Anchoring the chain to the checkpoint [cite: 15, 22]
+    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
+    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+
+    prev_mac_ = mac;
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
 }
 
 /**
@@ -194,12 +317,44 @@ void LogManager::log_checkpoint(UNUSED_ATTRIBUTE BufferManager& buffer_manager) 
  */
 void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
     size_t scan_offset = 0;
+    std::array<unsigned char, 16> running_prev_mac = {0};
+
     while (true) {
+        size_t record_start_offset = scan_offset;
         LogRecordType type = LogRecordType::INVALID_RECORD_TYPE;
         log_file_->read_block(scan_offset, sizeof(LogRecordType), reinterpret_cast<char*>(&type));
         if (type == LogRecordType::INVALID_RECORD_TYPE || type < LogRecordType::ABORT_RECORD || type > LogRecordType::CHECKPOINT_RECORD) {
             break;
         }
+        size_t data_size = 0;
+        if (type == LogRecordType::UPDATE_RECORD) {
+            // type + txn + page + len + offset
+            size_t header_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4);
+            uint64_t img_len;
+            log_file_->read_block(record_start_offset + sizeof(LogRecordType) + (sizeof(uint64_t) * 2), sizeof(uint64_t), reinterpret_cast<char*>(&img_len));
+            data_size = header_size + (img_len * 2);
+        } else if (type == LogRecordType::CHECKPOINT_RECORD) {
+            uint64_t active_count;
+            log_file_->read_block(record_start_offset + sizeof(LogRecordType), sizeof(uint64_t), reinterpret_cast<char*>(&active_count));
+            data_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_count * sizeof(uint64_t) * 2);
+        } else {
+            // BEGIN, COMMIT, ABORT are just Type + TxnID
+            data_size = sizeof(LogRecordType) + sizeof(uint64_t);
+        }
+
+        // Read Data, Read Stored MAC, Recompute, and Compare
+        std::vector<char> actual_data(data_size);
+        log_file_->read_block(record_start_offset, data_size, actual_data.data());
+
+        std::array<unsigned char, 16> stored_mac;
+        log_file_->read_block(record_start_offset + data_size, 16, reinterpret_cast<char*>(stored_mac.data()));
+
+        auto recomputed_mac = compute_gmac(actual_data, running_prev_mac, record_start_offset);
+        if (recomputed_mac != stored_mac) {
+            throw std::runtime_error("TAMPER DETECTION: Log integrity compromised at LSN " + std::to_string(record_start_offset));
+        }
+        running_prev_mac = stored_mac;
+
         scan_offset += sizeof(LogRecordType);
         if (type == LogRecordType::BEGIN_RECORD) {
             uint64_t txn_id = read_val<uint64_t>(scan_offset);
@@ -247,8 +402,11 @@ void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
                 txn_id_to_first_log_record[txn_id] = first_offset;
             }
         }
+        // skip mac in scan offset
+        scan_offset = record_start_offset + data_size + 16;
     }
     current_offset_ = scan_offset;
+    prev_mac_ = running_prev_mac;
     std::set<uint64_t> txns_to_undo = active_txns;
     for (uint64_t txn_id : txns_to_undo) {
         rollback_txn(txn_id, buffer_manager);
