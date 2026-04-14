@@ -26,7 +26,7 @@ Initial performance evaluations scaling from 1 to 16 threads demonstrate that wh
 
 *Note: Future updates will include a transition to a fully asynchronous background auditor thread to further remove MAC computation from the critical write path.*
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 * **Language:** C++
 * **Cryptography:** OpenSSL (`EVP_aes_256_gcm`)
@@ -40,6 +40,7 @@ Ensure you have the following installed on your system:
 * `g++` (or any C++17 compatible compiler)
 * `cmake` (v3.10+)
 * `openssl` (libssl-dev)
+Or use the dev container provided with Docker.
 
 ### Build Instructions
 Clone the repository and build the project using CMake:
