@@ -19,11 +19,11 @@ const unsigned char AES_IV[12] = {0};  // 96-bit IV
 
 // Computes H_i = MAC(Data_i || H_{i-1} || LSN_i)
 std::array<unsigned char, 16> compute_gmac(
+    EVP_CIPHER_CTX* ctx, 
     const std::vector<char>& data, 
     const std::array<unsigned char, 16>& prev_mac, 
     uint64_t lsn) 
 {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     std::array<unsigned char, 16> out_mac = {0};
     
     // AES-256-GCM
@@ -120,6 +120,7 @@ void LogManager::reset(File* log_file) {
 }
 
 void LogManager::auditor_loop(){
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     while (true) {
         LogRecordBuffer record;
         {
@@ -132,11 +133,12 @@ void LogManager::auditor_loop(){
             record = std::move(log_queue_.front());
             log_queue_.pop();
         }
-        std::array<unsigned char, 16> mac = compute_gmac(record.data, prev_mac_, record.lsn);
+        std::array<unsigned char, 16> mac = compute_gmac(ctx, record.data, prev_mac_, record.lsn);
         record.data.insert(record.data.end(), mac.begin(), mac.end());
         prev_mac_ = mac;
         log_file_->write_block(record.data.data(), record.lsn, record.data.size());
     }
+    EVP_CIPHER_CTX_free(ctx);
 }
 
 /// Get log records
@@ -343,6 +345,7 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
 void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
     size_t scan_offset = 0;
     std::array<unsigned char, 16> running_prev_mac = {0};
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 
     while (true) {
         size_t record_start_offset = scan_offset;
@@ -374,7 +377,7 @@ void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
         std::array<unsigned char, 16> stored_mac;
         log_file_->read_block(record_start_offset + data_size, 16, reinterpret_cast<char*>(stored_mac.data()));
 
-        auto recomputed_mac = compute_gmac(actual_data, running_prev_mac, record_start_offset);
+        auto recomputed_mac = compute_gmac(ctx, actual_data, running_prev_mac, record_start_offset);
         if (recomputed_mac != stored_mac) {
             throw std::runtime_error("TAMPER DETECTION: Log integrity compromised at LSN " + std::to_string(record_start_offset));
         }
@@ -432,6 +435,7 @@ void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
     }
     current_offset_ = scan_offset;
     prev_mac_ = running_prev_mac;
+    EVP_CIPHER_CTX_free(ctx);
     std::set<uint64_t> txns_to_undo = active_txns;
     for (uint64_t txn_id : txns_to_undo) {
         rollback_txn(txn_id, buffer_manager);
