@@ -129,14 +129,18 @@ void LogManager::auditor_loop(){
             if (stop_auditor_ && log_queue_.empty()) {
                 break;
             }
-
-            record = std::move(log_queue_.front());
-            log_queue_.pop();
+            while (!log_queue_.empty()) {
+                local_batch.push_back(std::move(log_queue_.front()));
+                log_queue_.pop();
+            }
         }
-        std::array<unsigned char, 16> mac = compute_gmac(ctx, record.data, prev_mac_, record.lsn);
-        record.data.insert(record.data.end(), mac.begin(), mac.end());
-        prev_mac_ = mac;
-        log_file_->write_block(record.data.data(), record.lsn, record.data.size());
+        for (auto& record : local_batch) {
+            std::array<unsigned char, 16> mac = compute_gmac(ctx, record.data, prev_mac_, record.lsn);
+            
+            record.data.insert(record.data.end(), mac.begin(), mac.end());
+            prev_mac_ = mac;
+            log_file_->write_block(record.data.data(), record.lsn, record.data.size());
+        }
     }
     EVP_CIPHER_CTX_free(ctx);
 }
