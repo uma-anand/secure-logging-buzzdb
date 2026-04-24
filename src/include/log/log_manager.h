@@ -6,12 +6,21 @@
 #include <mutex>
 #include <set>
 #include <array>
+#include<condition_variable>
+#include <queue>
+#include <thread>
 #include <vector>
 
 #include "buffer/buffer_manager.h"
 #include "storage/test_file.h"
 
 namespace buzzdb {
+
+// DS to pass serialized records to the auditor thread
+struct LogRecordBuffer {
+    std::vector<char> data;
+    uint64_t lsn; // assigned file offset for this record
+};
 
 class LogManager {
    public:
@@ -82,6 +91,15 @@ class LogManager {
     std::map<LogRecordType, uint64_t> log_record_type_to_count;
 
     std::set<uint64_t> active_txns;
+
+    // asynchronous auditing
+    std::queue<LogRecordBuffer> log_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    std::thread auditor_thread_;
+    std::atomic<bool> stop_auditor_{false};
+
+    void auditor_loop();
 
     template <typename T>
     void write_val(T val) {

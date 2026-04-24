@@ -74,9 +74,21 @@ LogManager::LogManager(File* log_file) {
     log_record_type_to_count[LogRecordType::UPDATE_RECORD] = 0;
     log_record_type_to_count[LogRecordType::BEGIN_RECORD] = 0;
     log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD] = 0;
+    stop_auditor_ = false;
+    auditor_thread_ = std::thread(&LogManager::auditor_loop, this);
 }
 
-LogManager::~LogManager() {}
+LogManager::~LogManager() {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        stop_auditor_ = true;
+    }
+    cv_.notify_one();
+    
+    if (auditor_thread_.joinable()) {
+        auditor_thread_.join();
+    }
+}
 
 LogManager::LogManager(const LogManager& other) {
     log_file_ = other.log_file_;
@@ -105,6 +117,26 @@ void LogManager::reset(File* log_file) {
     txn_id_to_first_log_record.clear();
     log_record_type_to_count.clear();
     active_txns.clear();
+}
+
+void LogManager::auditor_loop(){
+    while (true) {
+        LogRecordBuffer record;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            cv_.wait(lock, [this] { return !log_queue_.empty() || stop_auditor_; });
+            if (stop_auditor_ && log_queue_.empty()) {
+                break;
+            }
+
+            record = std::move(log_queue_.front());
+            log_queue_.pop();
+        }
+        std::array<unsigned char, 16> mac = compute_gmac(record.data, prev_mac_, record.lsn);
+        record.data.insert(record.data.end(), mac.begin(), mac.end());
+        prev_mac_ = mac;
+        log_file_->write_block(record.data.data(), record.lsn, record.data.size());
+    }
 }
 
 /// Get log records
@@ -142,12 +174,13 @@ void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
     append_to_buf(type);
     append_to_buf(txn_id);
 
-    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
-    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
-
-    prev_mac_ = mac;
-    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
-    current_offset_ += record_buffer.size();
+    uint64_t assigned_lsn = current_offset_;
+    current_offset_ += record_buffer.size() + 16; 
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        log_queue_.push({std::move(record_buffer), assigned_lsn});
+    }
+    cv_.notify_one();
 }
 
 /**
@@ -170,12 +203,13 @@ void LogManager::log_commit(uint64_t txn_id) {
     append_to_buf(type);
     append_to_buf(txn_id);
 
-    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
-    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
-
-    prev_mac_ = mac;
-    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
-    current_offset_ += record_buffer.size();
+    uint64_t assigned_lsn = current_offset_;
+    current_offset_ += record_buffer.size() + 16;
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        log_queue_.push({std::move(record_buffer), assigned_lsn});
+    }
+    cv_.notify_one();
 }
 
 /**
@@ -201,7 +235,7 @@ void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
     };
 
-    // 1. Serialize everything into the buffer
+    // Serialize everything into the buffer
     LogRecordType type = LogRecordType::UPDATE_RECORD;
     append_to_buf(type);
     append_to_buf(txn_id);
@@ -209,21 +243,20 @@ void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
     append_to_buf(length);
     append_to_buf(offset);
 
-    // Append images to buffer so they are hashed
     const char* before_ptr = reinterpret_cast<const char*>(before_img);
     record_buffer.insert(record_buffer.end(), before_ptr, before_ptr + length);
 
     const char* after_ptr = reinterpret_cast<const char*>(after_img);
     record_buffer.insert(record_buffer.end(), after_ptr, after_ptr + length);
 
-    // 2. Compute and Append MAC
-    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
-    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+    uint64_t assigned_lsn = current_offset_;
+    current_offset_ += record_buffer.size() + 16;
 
-    // 3. Persistent Write
-    prev_mac_ = mac;
-    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
-    current_offset_ += record_buffer.size();
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        log_queue_.push({std::move(record_buffer), assigned_lsn});
+    }
+    cv_.notify_one();
 }
 
 /**
@@ -250,22 +283,13 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
     append_to_buf(type);
     append_to_buf(txn_id);
 
-    // Compute the MAC over the buffer, previous MAC, and current LSN
-    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
-
-    // std::cout << "Txn " << txn_id << " at LSN " << current_offset_ << " | MAC: ";
-    // for (int i = 0; i < 16; ++i) {
-    //     printf("%02x", mac[i]);
-    // }
-    // std::cout << std::endl;
-    
-    // Append the MAC to the buffer
-    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
-
-    // Write the entire authenticated record to disk
-    prev_mac_ = mac;
-    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
-    current_offset_ += record_buffer.size();
+    uint64_t assigned_lsn = current_offset_;
+    current_offset_ += record_buffer.size() + 16;
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        log_queue_.push({std::move(record_buffer), assigned_lsn});
+    }
+    cv_.notify_one();
 }
 
 /**
@@ -295,13 +319,14 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
         append_to_buf(txn_id_to_first_log_record[txn_id]);
     }
 
-    // Anchoring the chain to the checkpoint [cite: 15, 22]
-    std::array<unsigned char, 16> mac = compute_gmac(record_buffer, prev_mac_, current_offset_);
-    record_buffer.insert(record_buffer.end(), mac.begin(), mac.end());
+    uint64_t assigned_lsn = current_offset_;
+    current_offset_ += record_buffer.size() + 16;
 
-    prev_mac_ = mac;
-    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
-    current_offset_ += record_buffer.size();
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        log_queue_.push({std::move(record_buffer), assigned_lsn});
+    }
+    cv_.notify_one();
 }
 
 /**
