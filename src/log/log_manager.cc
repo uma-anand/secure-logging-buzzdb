@@ -122,7 +122,7 @@ void LogManager::reset(File* log_file) {
 void LogManager::auditor_loop(){
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     while (true) {
-        LogRecordBuffer record;
+        std::vector<LogRecordBuffer> local_batch;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             cv_.wait(lock, [this] { return !log_queue_.empty() || stop_auditor_; });
