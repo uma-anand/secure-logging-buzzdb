@@ -167,6 +167,9 @@ void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
     active_txns.erase(txn_id);
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -196,6 +199,9 @@ void LogManager::log_commit(uint64_t txn_id) {
     active_txns.erase(txn_id);
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -232,6 +238,9 @@ void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
     log_record_type_to_count[LogRecordType::UPDATE_RECORD]++;
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4) + (length * 2) + 16;
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -276,6 +285,8 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
     
     // Buffer the record data
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -305,6 +316,8 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
     buffer_manager.flush_all_pages();
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_txns.size() * sizeof(uint64_t) * 2) + 16;
+    record_buffer.reserve(exact_size);
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
