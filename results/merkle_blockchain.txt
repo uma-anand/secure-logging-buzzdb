@@ -1,0 +1,20 @@
+Run on (12 X 2611.21 MHz CPU s)
+2026-04-25 22:30:00
+--------------------------------------------------------------------------------------------------------------------------------------
+Benchmark                                                                                               Time           CPU Iterations
+--------------------------------------------------------------------------------------------------------------------------------------
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:1_mean          9221 us        463 us        585   216.642kB/s    132.049 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:1_median       10897 us        535 us        585   150.562kB/s    91.7714 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:1_stddev        4159 us        200 us        585   129.426kB/s    78.8882 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:2_mean          5067 us        845 us       2000   342.534kB/s    208.783 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:2_median        5700 us        837 us       2000   287.817kB/s    175.431 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:2_stddev        1342 us        145 us       2000    106.46kB/s    64.8902 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:4_mean          3578 us        774 us       2492   458.728kB/s    279.605 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:4_median        3603 us        774 us       2492   455.318kB/s    277.527 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:4_stddev          94 us          6 us       2492   12.1209kB/s    7.38797 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:8_mean          2264 us        539 us       2528   732.347kB/s    446.383 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:8_median        2145 us        527 us       2528   764.911kB/s    466.232 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:8_stddev         296 us         57 us       2528   89.8381kB/s    54.7584 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:16_mean         2620 us        686 us       2512   679.465kB/s     414.15 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:16_median       2104 us        638 us       2512   779.915kB/s    475.376 items/s
+LoggingBenchmark/SimulatedTPCCTransaction/min_time:5.000/repeats:3/real_time/threads:16_stddev        990 us        123 us       2512   211.841kB/s    129.122 items/s
