@@ -1,0 +1,567 @@
+
+#include "log/log_manager.h"
+
+#include <string.h>
+
+#include <cassert>
+#include <cstddef>
+#include <iostream>
+#include <openssl/evp.h>
+
+#include "common/macros.h"
+#include "storage/test_file.h"
+
+namespace buzzdb {
+
+// Computes H_i = SHA256(Data_i || H_{i-1} || LSN_i)
+std::array<unsigned char, 32> compute_sha256(
+    EVP_MD_CTX* ctx, 
+    const std::vector<char>& data, 
+    const std::array<unsigned char, 32>& prev_hash, 
+    uint64_t lsn) 
+{
+    std::array<unsigned char, 32> out_hash = {0};
+    
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    
+    if (!data.empty()) {
+        EVP_DigestUpdate(ctx, data.data(), data.size());
+    }
+    EVP_DigestUpdate(ctx, prev_hash.data(), prev_hash.size());
+    EVP_DigestUpdate(ctx, &lsn, sizeof(uint64_t));
+    
+    unsigned int final_len = 0;
+    EVP_DigestFinal_ex(ctx, out_hash.data(), &final_len);
+    
+    return out_hash;
+}
+
+// Computes Merkle Root from a vector of leaf hashes
+std::array<unsigned char, 32> compute_merkle_root(
+    EVP_MD_CTX* ctx,
+    const std::vector<std::array<unsigned char, 32>>& leaves)
+{
+    if (leaves.empty()) return {0};
+    if (leaves.size() == 1) return leaves[0];
+
+    std::vector<std::array<unsigned char, 32>> current_level = leaves;
+    std::vector<std::array<unsigned char, 32>> next_level;
+
+    while (current_level.size() > 1) {
+        for (size_t i = 0; i < current_level.size(); i += 2) {
+            std::array<unsigned char, 32> parent_hash;
+            EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+            
+            // Left child
+            EVP_DigestUpdate(ctx, current_level[i].data(), 32);
+            
+            // Right child (duplicate left if odd number of nodes)
+            if (i + 1 < current_level.size()) {
+                EVP_DigestUpdate(ctx, current_level[i+1].data(), 32);
+            } else {
+                EVP_DigestUpdate(ctx, current_level[i].data(), 32);
+            }
+            
+            EVP_DigestFinal_ex(ctx, parent_hash.data(), NULL);
+            next_level.push_back(parent_hash);
+        }
+        current_level = next_level;
+        next_level.clear();
+    }
+    
+    return current_level[0]; // final Merkle root
+}
+
+/**
+ * Functionality of the buffer manager that might be handy
+
+ Flush all the dirty pages to the disk
+        buffer_manager.flush_all_pages():
+
+ Write @data of @length at an @offset the buffer page @page_id
+        BufferFrame& frame = buffer_manager.fix_page(page_id, true);
+        memcpy(&frame.get_data()[offset], data, length);
+        buffer_manager.unfix_page(frame, true);
+
+ * Read and Write from/to the log_file
+   log_file_->read_block(offset, size, data);
+
+   Usage:
+   uint64_t txn_id;
+   log_file_->read_block(offset, sizeof(uint64_t), reinterpret_cast<char *>(&txn_id));
+   log_file_->write_block(reinterpret_cast<char *> (&txn_id), offset, sizeof(uint64_t));
+ */
+
+LogManager::LogManager(File* log_file) {
+    log_file_ = log_file;
+    log_record_type_to_count[LogRecordType::ABORT_RECORD] = 0;
+    log_record_type_to_count[LogRecordType::COMMIT_RECORD] = 0;
+    log_record_type_to_count[LogRecordType::UPDATE_RECORD] = 0;
+    log_record_type_to_count[LogRecordType::BEGIN_RECORD] = 0;
+    log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD] = 0;
+}
+
+LogManager::~LogManager() {
+}
+
+LogManager::LogManager(const LogManager& other) {
+    log_file_ = other.log_file_;
+    current_offset_ = other.current_offset_;
+    txn_id_to_first_log_record = other.txn_id_to_first_log_record;
+    log_record_type_to_count = other.log_record_type_to_count;
+    active_txns = other.active_txns;
+    // do not copy log_mutex_
+}
+
+LogManager& LogManager::operator=(const LogManager& other) {
+    if (this != &other) {
+        log_file_ = other.log_file_;
+        current_offset_ = other.current_offset_;
+        txn_id_to_first_log_record = other.txn_id_to_first_log_record;
+        log_record_type_to_count = other.log_record_type_to_count;
+        active_txns = other.active_txns;
+        // do not copy log_mutex_
+    }
+    return *this;
+}
+
+void LogManager::reset(File* log_file) {
+    log_file_ = log_file;
+    current_offset_ = 0;
+    txn_id_to_first_log_record.clear();
+    log_record_type_to_count.clear();
+    active_txns.clear();
+}
+
+
+/// Get log records
+uint64_t LogManager::get_total_log_records() { 
+    uint64_t total = 0;
+    for (auto const& [type, count] : log_record_type_to_count) {
+        total += count;
+    }
+    return total; 
+}
+
+uint64_t LogManager::get_total_log_records_of_type(UNUSED_ATTRIBUTE LogRecordType type) {
+    return log_record_type_to_count[type];
+}
+
+/**
+ * Increment the ABORT_RECORD count.
+ * Rollback the provided transaction.
+ * Add abort log record to the log file.
+ * Remove from the active transactions.
+ */
+void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_record_type_to_count[LogRecordType::ABORT_RECORD]++;
+    rollback_txn(txn_id, buffer_manager);
+    active_txns.erase(txn_id);
+
+    std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
+
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::ABORT_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    std::array<unsigned char, 32> leaf_hash = compute_sha256(ctx, record_buffer, {0}, current_offset_);
+    EVP_MD_CTX_free(ctx);
+
+    record_buffer.insert(record_buffer.end(), leaf_hash.begin(), leaf_hash.end());
+    current_block_leaves_.push_back(leaf_hash);
+
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
+}
+
+/**
+ * Increment the COMMIT_RECORD count
+ * Add commit log record to the log file
+ * Remove from the active transactions
+ */
+void LogManager::log_commit(uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_record_type_to_count[LogRecordType::COMMIT_RECORD]++;
+    active_txns.erase(txn_id);
+
+    std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
+
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::COMMIT_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    
+    std::array<unsigned char, 32> merkle_root = compute_merkle_root(ctx, current_block_leaves_);
+    
+    // Chain the block: Hash(CommitData || Previous Block Hash || Merkle Root)
+    std::array<unsigned char, 32> new_block_hash;
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, record_buffer.data(), record_buffer.size());
+    EVP_DigestUpdate(ctx, prev_block_hash_.data(), 32);
+    EVP_DigestUpdate(ctx, merkle_root.data(), 32);
+    EVP_DigestFinal_ex(ctx, new_block_hash.data(), NULL);
+    
+    EVP_MD_CTX_free(ctx);
+
+    // Append the final block hash to the commit record
+    record_buffer.insert(record_buffer.end(), new_block_hash.begin(), new_block_hash.end());
+
+    // Write to disk and reset the blockchain state for the next block
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
+    
+    prev_block_hash_ = new_block_hash;
+    current_block_leaves_.clear();
+}
+
+/**
+ * Increment the UPDATE_RECORD count
+ * Add the update log record to the log file
+ * @param txn_id		transaction id
+ * @param page_id		buffer page id
+ * @param length		length of the update tuple
+ * @param offset 		offset to the tuple in the buffer page
+ * @param before_img	before image of the buffer page at the given offset
+ * @param after_img		after image of the buffer page at the given offset
+ */
+void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
+                            uint64_t length, uint64_t offset,
+                            std::byte* before_img,
+                            std::byte* after_img) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_record_type_to_count[LogRecordType::UPDATE_RECORD]++;
+
+    std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4) + (length * 2);
+    record_buffer.reserve(exact_size);
+
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    // Serialize everything into the buffer
+    LogRecordType type = LogRecordType::UPDATE_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+    append_to_buf(page_id);
+    append_to_buf(length);
+    append_to_buf(offset);
+
+    const char* before_ptr = reinterpret_cast<const char*>(before_img);
+    record_buffer.insert(record_buffer.end(), before_ptr, before_ptr + length);
+
+    const char* after_ptr = reinterpret_cast<const char*>(after_img);
+    record_buffer.insert(record_buffer.end(), after_ptr, after_ptr + length);
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    std::array<unsigned char, 32> leaf_hash = compute_sha256(ctx, record_buffer, {0}, current_offset_);
+    EVP_MD_CTX_free(ctx);
+
+    // Append leaf hash to record and save to the current block
+    record_buffer.insert(record_buffer.end(), leaf_hash.begin(), leaf_hash.end());
+    current_block_leaves_.push_back(leaf_hash);
+
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
+}
+
+/**
+ * Increment the BEGIN_RECORD count
+ * Add the begin log record to the log file
+ * Add to the active transactions
+ */
+void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_record_type_to_count[LogRecordType::BEGIN_RECORD]++;
+    active_txns.insert(txn_id);
+    if (txn_id_to_first_log_record.find(txn_id) == txn_id_to_first_log_record.end()) {
+        txn_id_to_first_log_record[txn_id] = current_offset_;
+    }
+    
+    // Buffer the record data
+    std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + 16;
+    record_buffer.reserve(exact_size);
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::BEGIN_RECORD;
+    append_to_buf(type);
+    append_to_buf(txn_id);
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    std::array<unsigned char, 32> leaf_hash = compute_sha256(ctx, record_buffer, {0}, current_offset_);
+    EVP_MD_CTX_free(ctx);
+
+    record_buffer.insert(record_buffer.end(), leaf_hash.begin(), leaf_hash.end());
+    current_block_leaves_.push_back(leaf_hash);
+
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
+}
+
+/**
+ * Increment the CHECKPOINT_RECORD count
+ * Flush all dirty pages to the disk (USE: buffer_manager.flush_all_pages())
+ * Add the checkpoint log record to the log file
+ */
+void LogManager::log_checkpoint(BufferManager& buffer_manager) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD]++;
+    buffer_manager.flush_all_pages();
+
+    std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_txns.size() * sizeof(uint64_t) * 2) + 16;
+    record_buffer.reserve(exact_size);
+    auto append_to_buf = [&record_buffer](const auto& val) {
+        const char* bytes = reinterpret_cast<const char*>(&val);
+        record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
+    };
+
+    LogRecordType type = LogRecordType::CHECKPOINT_RECORD;
+    append_to_buf(type);
+    
+    uint64_t active_count = active_txns.size();
+    append_to_buf(active_count);
+
+    for (uint64_t txn_id : active_txns) {
+        append_to_buf(txn_id);
+        append_to_buf(txn_id_to_first_log_record[txn_id]);
+    }
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    std::array<unsigned char, 32> leaf_hash = compute_sha256(ctx, record_buffer, {0}, current_offset_);
+    EVP_MD_CTX_free(ctx);
+
+    record_buffer.insert(record_buffer.end(), leaf_hash.begin(), leaf_hash.end());
+    current_block_leaves_.push_back(leaf_hash);
+
+    log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
+    current_offset_ += record_buffer.size();
+}
+
+/**
+ * @Analysis Phase:
+ * 		1. Get the active transactions and commited transactions
+ * 		2. Restore the txn_id_to_first_log_record
+ * @Redo Phase:
+ * 		1. Redo the entire log tape to restore the buffer page
+ * 		2. For UPDATE logs: write the after_img to the buffer page
+ * 		3. For ABORT logs: rollback the transactions
+ * 	@Undo Phase
+ * 		1. Rollback the transactions which are active and not commited
+ */
+void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+    size_t scan_offset = 0;
+    std::array<unsigned char, 32> running_prev_block_hash = {0}; 
+    std::vector<std::array<unsigned char, 32>> running_block_leaves;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+
+    while (true) {
+        size_t record_start_offset = scan_offset;
+        LogRecordType type = LogRecordType::INVALID_RECORD_TYPE;
+        log_file_->read_block(scan_offset, sizeof(LogRecordType), reinterpret_cast<char*>(&type));
+        if (type == LogRecordType::INVALID_RECORD_TYPE || type < LogRecordType::ABORT_RECORD || type > LogRecordType::CHECKPOINT_RECORD) {
+            break;
+        }
+        size_t data_size = 0;
+        if (type == LogRecordType::UPDATE_RECORD) {
+            // type + txn + page + len + offset
+            size_t header_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4);
+            uint64_t img_len;
+            log_file_->read_block(record_start_offset + sizeof(LogRecordType) + (sizeof(uint64_t) * 2), sizeof(uint64_t), reinterpret_cast<char*>(&img_len));
+            data_size = header_size + (img_len * 2);
+        } else if (type == LogRecordType::CHECKPOINT_RECORD) {
+            uint64_t active_count;
+            log_file_->read_block(record_start_offset + sizeof(LogRecordType), sizeof(uint64_t), reinterpret_cast<char*>(&active_count));
+            data_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_count * sizeof(uint64_t) * 2);
+        } else {
+            // BEGIN, COMMIT, ABORT are just Type + TxnID
+            data_size = sizeof(LogRecordType) + sizeof(uint64_t);
+        }
+
+        // Read Data, Read Stored MAC, Recompute, and Compare
+        std::vector<char> actual_data(data_size);
+        log_file_->read_block(record_start_offset, data_size, actual_data.data());
+
+        std::array<unsigned char, 32> stored_hash;
+        log_file_->read_block(record_start_offset + data_size, 32, reinterpret_cast<char*>(stored_hash.data()));
+
+        // --- BLOCKCHAIN VERIFICATION LOGIC ---
+        if (type == LogRecordType::COMMIT_RECORD) {
+            // rebuild the Merkle Root from accumulated leaves.
+            std::array<unsigned char, 32> recomputed_merkle_root = compute_merkle_root(ctx, running_block_leaves);
+            
+            // recompute the block chain hash
+            std::array<unsigned char, 32> recomputed_block_hash;
+            EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+            EVP_DigestUpdate(ctx, actual_data.data(), actual_data.size());
+            EVP_DigestUpdate(ctx, running_prev_block_hash.data(), 32);
+            EVP_DigestUpdate(ctx, recomputed_merkle_root.data(), 32);
+            EVP_DigestFinal_ex(ctx, recomputed_block_hash.data(), NULL);
+
+            if (recomputed_block_hash != stored_hash) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error("TAMPER DETECTION: Block integrity compromised at COMMIT LSN " + std::to_string(record_start_offset));
+            }
+            
+            running_prev_block_hash = stored_hash;
+            running_block_leaves.clear(); 
+        } else {
+            // All other records are leaves. Recompute their individual hash.
+            auto recomputed_leaf_hash = compute_sha256(ctx, actual_data, {0}, record_start_offset);
+            
+            if (recomputed_leaf_hash != stored_hash) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error("TAMPER DETECTION: Leaf record compromised at LSN " + std::to_string(record_start_offset));
+            }
+            
+            // Add the verified leaf to the current block's tree
+            running_block_leaves.push_back(stored_hash);
+        }
+
+        scan_offset += sizeof(LogRecordType);
+        if (type == LogRecordType::BEGIN_RECORD) {
+            uint64_t txn_id = read_val<uint64_t>(scan_offset);
+            active_txns.insert(txn_id);
+            if (txn_id_to_first_log_record.find(txn_id) == txn_id_to_first_log_record.end()) {
+                txn_id_to_first_log_record[txn_id] = scan_offset - sizeof(LogRecordType) - sizeof(uint64_t);
+            }
+        } 
+        else if (type == LogRecordType::COMMIT_RECORD) {
+            uint64_t txn_id = read_val<uint64_t>(scan_offset);
+            active_txns.erase(txn_id);
+        }
+        else if (type == LogRecordType::ABORT_RECORD) {
+            uint64_t txn_id = read_val<uint64_t>(scan_offset);
+            size_t temp_offset = current_offset_;
+            current_offset_ = scan_offset;
+            rollback_txn(txn_id, buffer_manager);
+            current_offset_ = temp_offset;
+            active_txns.erase(txn_id);
+        }
+        else if (type == LogRecordType::UPDATE_RECORD) {
+            read_val<uint64_t>(scan_offset); // move offset after trans id
+            uint64_t page_id = read_val<uint64_t>(scan_offset);
+            uint64_t length = read_val<uint64_t>(scan_offset);
+            uint64_t offset = read_val<uint64_t>(scan_offset);
+
+            std::vector<char> before_img(length);
+            log_file_->read_block(scan_offset, length, before_img.data());
+            scan_offset += length;
+
+            std::vector<char> after_img(length);
+            log_file_->read_block(scan_offset, length, after_img.data());
+            scan_offset += length;
+
+            BufferFrame& frame = buffer_manager.fix_page(page_id, true);
+            memcpy(&frame.get_data()[offset], after_img.data(), length);
+            buffer_manager.unfix_page(frame, true);
+        }
+        else if (type == LogRecordType::CHECKPOINT_RECORD) {
+            uint64_t active_count = read_val<uint64_t>(scan_offset);
+            for (uint64_t i = 0; i < active_count; ++i) {
+                uint64_t txn_id = read_val<uint64_t>(scan_offset);
+                uint64_t first_offset = read_val<uint64_t>(scan_offset);
+                active_txns.insert(txn_id);
+                txn_id_to_first_log_record[txn_id] = first_offset;
+            }
+        }
+        // skip hash in scan offset
+        scan_offset = record_start_offset + data_size + 32;
+    }
+    current_offset_ = scan_offset;
+    EVP_MD_CTX_free(ctx);
+    prev_block_hash_ = running_prev_block_hash; 
+    current_block_leaves_ = running_block_leaves;
+    std::set<uint64_t> txns_to_undo = active_txns;
+    for (uint64_t txn_id : txns_to_undo) {
+        rollback_txn(txn_id, buffer_manager);
+    }
+}
+
+/**
+ * Use txn_id_to_first_log_record to get the begin of the current transaction
+ * Walk through the log tape and rollback the changes by writing the before
+ * image of the tuple on the buffer page.
+ * Note: There might be other transactions' log records interleaved, so be careful to
+ * only undo the changes corresponding to current transactions.
+ */
+void LogManager::rollback_txn(UNUSED_ATTRIBUTE uint64_t txn_id,
+                              UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
+    if (txn_id_to_first_log_record.find(txn_id) == txn_id_to_first_log_record.end()) {
+        return; 
+    }
+
+    size_t scan_offset = txn_id_to_first_log_record[txn_id];
+
+    struct UpdateInfo {
+        uint64_t page_id;
+        uint64_t length;
+        uint64_t offset;
+        std::vector<char> before_img;
+    };
+    
+    std::vector<UpdateInfo> txn_updates;
+
+    while (scan_offset < current_offset_) {
+        LogRecordType type = LogRecordType::INVALID_RECORD_TYPE;
+        log_file_->read_block(scan_offset, sizeof(LogRecordType), reinterpret_cast<char*>(&type));
+        
+        if (type == LogRecordType::INVALID_RECORD_TYPE || type < LogRecordType::ABORT_RECORD || type > LogRecordType::CHECKPOINT_RECORD) {
+            break;
+        }
+        scan_offset += sizeof(LogRecordType);
+
+        if (type == LogRecordType::BEGIN_RECORD || type == LogRecordType::COMMIT_RECORD || type == LogRecordType::ABORT_RECORD) {
+            scan_offset += sizeof(uint64_t);
+        }
+        else if (type == LogRecordType::UPDATE_RECORD) {
+            uint64_t current_txn_id = read_val<uint64_t>(scan_offset);
+            uint64_t page_id = read_val<uint64_t>(scan_offset);
+            uint64_t length = read_val<uint64_t>(scan_offset);
+            uint64_t offset = read_val<uint64_t>(scan_offset);
+
+            std::vector<char> before_img(length);
+            log_file_->read_block(scan_offset, length, before_img.data());
+            scan_offset += length;
+
+            scan_offset += length; 
+
+            if (current_txn_id == txn_id) {
+                txn_updates.push_back({page_id, length, offset, before_img});
+            }
+        }
+        else if (type == LogRecordType::CHECKPOINT_RECORD) {
+            uint64_t active_count = read_val<uint64_t>(scan_offset);
+            scan_offset += active_count * (sizeof(uint64_t) * 2);
+        }
+    }
+    for (auto it = txn_updates.rbegin(); it != txn_updates.rend(); ++it) {
+        BufferFrame& frame = buffer_manager.fix_page(it->page_id, true);
+        memcpy(&frame.get_data()[it->offset], it->before_img.data(), it->length);
+        buffer_manager.unfix_page(frame, true);
+    }
+}
+
+}  // namespace buzzdb

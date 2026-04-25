@@ -99,6 +99,10 @@ class LogManager {
     std::thread auditor_thread_;
     std::atomic<bool> stop_auditor_{false};
 
+    // merkle-blockchain
+    std::vector<std::array<unsigned char, 32>> current_block_leaves_;
+    std::array<unsigned char, 32> prev_block_hash_ = {0};
+
     void auditor_loop();
 
     template <typename T>
