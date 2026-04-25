@@ -51,3 +51,11 @@ cd secure-logging-buzzdb
 mkdir build && cd build
 cmake ..
 make
+```
+
+To build and run the tests, use
+```bash
+cd build
+make log_benchmark -j4
+./log_benchmark
+```
