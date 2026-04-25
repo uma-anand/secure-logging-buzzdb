@@ -13,37 +13,6 @@
 
 namespace buzzdb {
 
-// 32 bit hash
-std::array<unsigned char, 32> prev_hash_ = {0};
-
-// Computes H_i = SHA256(Data_i || H_{i-1} || LSN_i)
-std::array<unsigned char, 32> compute_sha256(
-    EVP_MD_CTX* ctx, 
-    const std::vector<char>& data, 
-    const std::array<unsigned char, 32>& prev_hash, 
-    uint64_t lsn) 
-{
-    std::array<unsigned char, 32> out_hash = {0};
-    
-    // Initialize SHA-256 digest
-    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    
-    // 1. Data_i
-    if (!data.empty()) {
-        EVP_DigestUpdate(ctx, data.data(), data.size());
-    }
-    // 2. H_{i-1}
-    EVP_DigestUpdate(ctx, prev_hash.data(), prev_hash.size());
-    // 3. LSN_i
-    EVP_DigestUpdate(ctx, &lsn, sizeof(uint64_t));
-    
-    // Finalize hash
-    unsigned int final_len = 0;
-    EVP_DigestFinal_ex(ctx, out_hash.data(), &final_len);
-    
-    return out_hash;
-}
-
 /**
  * Functionality of the buffer manager that might be handy
 
@@ -73,7 +42,8 @@ LogManager::LogManager(File* log_file) {
     log_record_type_to_count[LogRecordType::CHECKPOINT_RECORD] = 0;
 }
 
-LogManager::~LogManager() {}
+LogManager::~LogManager() {
+}
 
 LogManager::LogManager(const LogManager& other) {
     log_file_ = other.log_file_;
@@ -130,6 +100,9 @@ void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
     active_txns.erase(txn_id);
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t);
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -138,13 +111,6 @@ void LogManager::log_abort(uint64_t txn_id, BufferManager& buffer_manager) {
     LogRecordType type = LogRecordType::ABORT_RECORD;
     append_to_buf(type);
     append_to_buf(txn_id);
-
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    std::array<unsigned char, 32> hash = compute_sha256(ctx, record_buffer, prev_hash_, current_offset_);
-    EVP_MD_CTX_free(ctx);
-
-    record_buffer.insert(record_buffer.end(), hash.begin(), hash.end());
-    prev_hash_ = hash;
 
     log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
     current_offset_ += record_buffer.size();
@@ -161,6 +127,9 @@ void LogManager::log_commit(uint64_t txn_id) {
     active_txns.erase(txn_id);
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t);
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -169,13 +138,6 @@ void LogManager::log_commit(uint64_t txn_id) {
     LogRecordType type = LogRecordType::COMMIT_RECORD;
     append_to_buf(type);
     append_to_buf(txn_id);
-
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    std::array<unsigned char, 32> hash = compute_sha256(ctx, record_buffer, prev_hash_, current_offset_);
-    EVP_MD_CTX_free(ctx);
-
-    record_buffer.insert(record_buffer.end(), hash.begin(), hash.end());
-    prev_hash_ = hash;
 
     log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
     current_offset_ += record_buffer.size();
@@ -199,6 +161,9 @@ void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
     log_record_type_to_count[LogRecordType::UPDATE_RECORD]++;
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4) + (length * 2);
+    record_buffer.reserve(exact_size);
+
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -212,19 +177,11 @@ void LogManager::log_update(uint64_t txn_id, uint64_t page_id,
     append_to_buf(length);
     append_to_buf(offset);
 
-    // Append images to buffer so they are hashed
     const char* before_ptr = reinterpret_cast<const char*>(before_img);
     record_buffer.insert(record_buffer.end(), before_ptr, before_ptr + length);
 
     const char* after_ptr = reinterpret_cast<const char*>(after_img);
     record_buffer.insert(record_buffer.end(), after_ptr, after_ptr + length);
-
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    std::array<unsigned char, 32> hash = compute_sha256(ctx, record_buffer, prev_hash_, current_offset_);
-    EVP_MD_CTX_free(ctx);
-
-    record_buffer.insert(record_buffer.end(), hash.begin(), hash.end());
-    prev_hash_ = hash;
 
     log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
     current_offset_ += record_buffer.size();
@@ -245,6 +202,8 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
     
     // Buffer the record data
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t);
+    record_buffer.reserve(exact_size);
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -253,13 +212,6 @@ void LogManager::log_txn_begin(UNUSED_ATTRIBUTE uint64_t txn_id) {
     LogRecordType type = LogRecordType::BEGIN_RECORD;
     append_to_buf(type);
     append_to_buf(txn_id);
-
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    std::array<unsigned char, 32> hash = compute_sha256(ctx, record_buffer, prev_hash_, current_offset_);
-    EVP_MD_CTX_free(ctx);
-
-    record_buffer.insert(record_buffer.end(), hash.begin(), hash.end());
-    prev_hash_ = hash;
 
     log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
     current_offset_ += record_buffer.size();
@@ -276,6 +228,8 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
     buffer_manager.flush_all_pages();
 
     std::vector<char> record_buffer;
+    size_t exact_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_txns.size() * sizeof(uint64_t) * 2);
+    record_buffer.reserve(exact_size);
     auto append_to_buf = [&record_buffer](const auto& val) {
         const char* bytes = reinterpret_cast<const char*>(&val);
         record_buffer.insert(record_buffer.end(), bytes, bytes + sizeof(val));
@@ -292,12 +246,6 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
         append_to_buf(txn_id_to_first_log_record[txn_id]);
     }
 
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    std::array<unsigned char, 32> hash = compute_sha256(ctx, record_buffer, prev_hash_, current_offset_);
-    EVP_MD_CTX_free(ctx);
-
-    record_buffer.insert(record_buffer.end(), hash.begin(), hash.end());
-    prev_hash_ = hash;
     log_file_->write_block(record_buffer.data(), current_offset_, record_buffer.size());
     current_offset_ += record_buffer.size();
 }
@@ -315,19 +263,18 @@ void LogManager::log_checkpoint(BufferManager& buffer_manager) {
  */
 void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
     size_t scan_offset = 0;
-    std::array<unsigned char, 32> running_prev_hash = {0};
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
 
     while (true) {
         size_t record_start_offset = scan_offset;
         LogRecordType type = LogRecordType::INVALID_RECORD_TYPE;
         log_file_->read_block(scan_offset, sizeof(LogRecordType), reinterpret_cast<char*>(&type));
+        
         if (type == LogRecordType::INVALID_RECORD_TYPE || type < LogRecordType::ABORT_RECORD || type > LogRecordType::CHECKPOINT_RECORD) {
             break;
         }
+        
         size_t data_size = 0;
         if (type == LogRecordType::UPDATE_RECORD) {
-            // type + txn + page + len + offset
             size_t header_size = sizeof(LogRecordType) + (sizeof(uint64_t) * 4);
             uint64_t img_len;
             log_file_->read_block(record_start_offset + sizeof(LogRecordType) + (sizeof(uint64_t) * 2), sizeof(uint64_t), reinterpret_cast<char*>(&img_len));
@@ -337,25 +284,11 @@ void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
             log_file_->read_block(record_start_offset + sizeof(LogRecordType), sizeof(uint64_t), reinterpret_cast<char*>(&active_count));
             data_size = sizeof(LogRecordType) + sizeof(uint64_t) + (active_count * sizeof(uint64_t) * 2);
         } else {
-            // BEGIN, COMMIT, ABORT are just Type + TxnID
             data_size = sizeof(LogRecordType) + sizeof(uint64_t);
         }
 
-        // Read Data, Read Stored hash, Recompute, and Compare
-        std::vector<char> actual_data(data_size);
-        log_file_->read_block(record_start_offset, data_size, actual_data.data());
-
-        std::array<unsigned char, 32> stored_hash;
-        log_file_->read_block(record_start_offset + data_size, 32, reinterpret_cast<char*>(stored_hash.data()));
-
-        auto recomputed_hash = compute_sha256(ctx, actual_data, running_prev_hash, record_start_offset);
-        if (recomputed_hash != stored_hash) {
-            EVP_MD_CTX_free(ctx);
-            throw std::runtime_error("TAMPER DETECTION: Log integrity compromised at LSN " + std::to_string(record_start_offset));
-        }
-        running_prev_hash = stored_hash;
-
         scan_offset += sizeof(LogRecordType);
+        
         if (type == LogRecordType::BEGIN_RECORD) {
             uint64_t txn_id = read_val<uint64_t>(scan_offset);
             active_txns.insert(txn_id);
@@ -402,12 +335,11 @@ void LogManager::recovery(UNUSED_ATTRIBUTE BufferManager& buffer_manager) {
                 txn_id_to_first_log_record[txn_id] = first_offset;
             }
         }
-        // skip hash in scan offset
-        scan_offset = record_start_offset + data_size + 32;
+        
+        scan_offset = record_start_offset + data_size;
     }
-    EVP_MD_CTX_free(ctx);
+    
     current_offset_ = scan_offset;
-    prev_hash_ = running_prev_hash;
     std::set<uint64_t> txns_to_undo = active_txns;
     for (uint64_t txn_id : txns_to_undo) {
         rollback_txn(txn_id, buffer_manager);
