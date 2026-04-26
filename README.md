@@ -16,15 +16,18 @@ Modern relational databases rely on the ARIES protocol and Write-Ahead Logging (
 * **Hardware-Accelerated Cryptography:** Leverages OpenSSL's `EVP` API to tap directly into AES-NI hardware instructions, significantly reducing CPU cycles compared to software-based hashing.
 * **Checkpoint Piggybacking:** Anchors the hash chain to ARIES fuzzy checkpoints by appending the master MAC directly to the checkpoint record, bypassing the need for additional costly `fsync` operations.
 * **Tamper-Evident Recovery Phase:** The database recovery sequence dynamically recomputes and verifies the AES-GMAC signature for every log record, halting and throwing a runtime error immediately upon detecting compromised state.
-* **Multithreaded Buffering:** Includes full threading support and buffer management to scale concurrent transactions.
+* **Asynchronous Verification & I/O Offloading:** Cryptographic work and disk I/O are completely removed from the database's critical write path. A concurrent, lock-free multi-producer queue batches MAC computations to an asynchronous background auditor thread, preventing serialization bottlenecks during high-frequency transaction commits.
 
 ## Performance and Benchmarks
 
 LETHAL includes a custom multi-threaded microbenchmark suite built with Google Benchmark (`SimulatedTPCCTransaction`) to mimic industry-standard OLTP workloads. 
 
-Initial performance evaluations scaling from 1 to 16 threads demonstrate that while cryptographic operations introduce some short-term synchronization contention, they do not fundamentally limit scalability. At high concurrency (16 threads), the secured prototype achieves an average throughput of ~341 items/s, successfully amortizing the cryptographic overhead.
+We have implemented three baselines to compare against. These are all in the `src/log` folder.
+* Unsecured WAL (`unsecured_wal.cc`)
+* Synchronous Hash Chain (`sync_hashchain.cc`)
+* Merkle Tree Blockchain (`merkle_blockchain.cc`) 
 
-*Note: Future updates will include a transition to a fully asynchronous background auditor thread to further remove MAC computation from the critical write path.*
+The LETHAL manager is in `src/log/lethal.cc`.
 
 ## Tech Stack
 
@@ -59,3 +62,5 @@ cd build
 make log_benchmark -j4
 ./log_benchmark
 ```
+
+To test baselines, copy paste appropriate code into `log_manager.cc`.
